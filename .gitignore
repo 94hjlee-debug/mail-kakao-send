@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+
+# 실제 환경변수
+.env
+Conf/.env
+
+# 카카오 인증 / 토큰
+Conf/kakao.txt
+Conf/kakao_tokens.json
+Conf/*token*.json
+
+# 메일 수신자 등 개인정보/운영설정
+Conf/maillist.txt
+
+# 실행 결과
+output/
+
+# 실행 상태 파일
+state/
+
+# 로그
+*.log
+
+# VS Code
+.vscode/
