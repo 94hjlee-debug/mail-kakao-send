@@ -30,3 +30,17 @@ state/
 
 # VS Code
 .vscode/
+
+Conf/.env
+Conf/kakao_sender_token.json
+Conf/kakao_friend_recipients.json
+
+Conf/kakao_tokens.json
+Conf/kakao.txt
+Conf/maillist.txt
+
+output/
+state/
+
+__pycache__/
+*.pyc

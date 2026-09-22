@@ -37,15 +37,11 @@ STATE_DIR = ROOT / "state"
 ENV_FILE = CONF_DIR / ".env"
 MAIL_LIST_FILE = CONF_DIR / "maillist.txt"
 SITES_FILE = CONF_DIR / "sites.txt"
-# [추가] 카카오톡 "나에게 보내기"용 리프레시 토큰 저장 파일. 이 파일이 없거나
-# 비어 있으면 카카오톡 전송은 그냥 건너뛰고 기존처럼 메일만 보냅니다(선택 기능).
-# 형식: {"이름": {"refresh_token": "..."}, ...}  -- kakao_auth_setup.py로 생성/추가.
-KAKAO_TOKENS_FILE = CONF_DIR / "kakao_tokens.json"
-# [추가] 실제로 카카오톡을 받을 사람 이름 목록. kakao_tokens.json에 등록돼
-# 있어도 이 파일에 이름이 없으면 보내지 않습니다(등록은 해두고 잠깐 끄고 싶을
-# 때 유용). maillist.txt/sites.txt와 같은 방식: 한 줄에 이름 하나, 맨 앞이
-# "#"으로 시작하는 줄은 제외(주석 처리)됩니다.
-KAKAO_LIST_FILE = CONF_DIR / "kakao.txt"
+# 카카오톡 "친구에게 보내기"용 설정.
+# - sender token: 발신자 1명의 refresh_token (외부 공개 금지)
+# - recipients: 친구 목록 API에서 선택한 수신자 uuid 목록 (외부 공개 금지)
+KAKAO_SENDER_TOKEN_FILE = CONF_DIR / "kakao_sender_token.json"
+KAKAO_RECIPIENTS_FILE = CONF_DIR / "kakao_friend_recipients.json"
 # [수정] 날짜 정보가 없는 사이트(예: cionew 처럼 목록형 페이지)를 위한
 # "이미 보낸 링크" 캐시 파일. 여기 기록된 링크는 다음 실행부터 제외됩니다.
 SEEN_LINKS_FILE = STATE_DIR / "seen_links.json"
@@ -159,28 +155,6 @@ def prune_seen_links(seen: dict[str, str], keep_days: int = SEEN_LINKS_KEEP_DAYS
 
 
 # ------------------------------------------------------------------------
-
-# [추가] 카카오톡 실제 수신 대상 목록(Conf/kakao.txt) 로드 -----------------------
-# maillist.txt와 같은 규칙: 한 줄에 이름 하나, 빈 줄/"#"으로 시작하는 줄은
-# 제외합니다. kakao_tokens.json에 등록돼 있어도 여기 없으면 발송하지 않습니다.
-def load_kakao_recipients(path: Path) -> list[str]:
-    if not path.exists():
-        print(f"카카오톡 수신자 목록 파일이 없습니다: {path}")
-        return []
-
-    names: list[str] = []
-    seen: set[str] = set()
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        name = line.split(",")[0].strip()
-        key = name.lower()
-        if name and key not in seen:
-            seen.add(key)
-            names.append(name)
-    return names
-
 
 # [추가] 하루 여러 번 실행 시 "새 내용이 있을 때만" 발송하기 위한 상태 기록 ------
 #
@@ -753,25 +727,23 @@ def send_email(body: str, saved_path: Path, count: int) -> None:
             print(f"메일을 보냈습니다: {mail_to}")
 
 
-# [추가] 카카오톡 "나에게 보내기" 전송 -----------------------------------------
+# 카카오톡 "친구에게 보내기" 전송 -------------------------------------------
 #
-# 카카오는 "친구에게 보내기"는 별도 사업자 검수가 필요하지만, "나에게 보내기"는
-# 검수 없이 바로 쓸 수 있습니다(문자 그대로 "내 카카오톡"에만 보낼 수 있음).
-# 그래서 수신자별로 각자 자기 계정에 1회 로그인 동의를 하게 한 뒤(kakao_auth_setup.py
-# 사용), 그때 발급받은 리프레시 토큰을 kakao_tokens.json에 저장해두면, 이 스크립트가
-# 매번 실행될 때마다 저장된 리프레시 토큰으로 액세스 토큰을 새로 발급받아 그 사람
-# "나에게 보내기"로 결과 요약을 전송합니다. 즉 94hjlee@naver.com, hojun_lee@nonghyup.com
-# 두 분도 각자 한 번만 로그인 동의를 하면, 사실상 두 분 모두에게 카카오톡으로 결과를
-# 받을 수 있습니다. 설정을 아직 안 했으면(kakao_tokens.json 없음) 조용히 건너뛰고
-# 기존처럼 메일만 보냅니다 — 완전히 선택 기능입니다.
-def kakao_refresh_access_token(refresh_token: str) -> tuple[str, str | None]:
-    """저장된 리프레시 토큰으로 액세스 토큰을 새로 발급받습니다.
+# 이 버전은 발신자 1명의 카카오 사용자 토큰을 사용해, 카카오 친구 목록 API에서
+# 선택해 저장한 수신자 uuid들에게 메시지를 전송합니다. 카카오 API 제한상 한 번에
+# 최대 5명까지 보낼 수 있으므로 수신자가 16명이면 5+5+5+1로 자동 분할합니다.
+#
+# 사전 준비는 kakao_friend_setup.py에서 진행합니다.
 
-    반환값: (액세스 토큰, 새 리프레시 토큰 또는 None)
-    카카오는 리프레시 토큰의 남은 유효기간이 1개월 미만일 때만 응답에 새
-    리프레시 토큰을 함께 내려줍니다. 그때는 저장된 값을 갱신해줘야 합니다
-    (없으면 기존 리프레시 토큰을 계속 씁니다).
-    """
+def _write_json_atomic(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(path)
+
+
+def kakao_refresh_access_token(refresh_token: str) -> tuple[str, str | None]:
+    """발신자의 refresh_token으로 새 access_token을 발급합니다."""
     client_id = os.getenv("KAKAO_REST_API_KEY", "").strip()
     if not client_id:
         raise RuntimeError("KAKAO_REST_API_KEY가 설정되어 있지 않습니다 (Conf/.env 확인)")
@@ -798,110 +770,165 @@ def kakao_refresh_access_token(refresh_token: str) -> tuple[str, str | None]:
     return access_token, (str(new_refresh_token) if new_refresh_token else None)
 
 
-def kakao_send_text(access_token: str, text: str, link_url: str) -> None:
-    """카카오톡 "나에게 보내기"로 기본 템플릿(텍스트형) 메시지 1건을 보냅니다."""
+def kakao_sender_access_token() -> str:
+    """저장된 발신자 refresh_token을 읽어 access_token을 만들고 필요 시 토큰을 갱신합니다."""
+    if not KAKAO_SENDER_TOKEN_FILE.exists():
+        raise RuntimeError(
+            f"발신자 토큰 파일이 없습니다: {KAKAO_SENDER_TOKEN_FILE}. "
+            "먼저 kakao_friend_setup.py에서 발신자 인증을 진행하세요."
+        )
+    try:
+        token_data = json.loads(KAKAO_SENDER_TOKEN_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"발신자 토큰 파일을 읽지 못했습니다: {e}") from e
+
+    refresh_token = str(token_data.get("refresh_token", "")).strip()
+    if not refresh_token:
+        raise RuntimeError("발신자 refresh_token이 없습니다. 발신자 인증을 다시 진행하세요.")
+
+    access_token, new_refresh_token = kakao_refresh_access_token(refresh_token)
+    if new_refresh_token and new_refresh_token != refresh_token:
+        token_data["refresh_token"] = new_refresh_token
+        _write_json_atomic(KAKAO_SENDER_TOKEN_FILE, token_data)
+    return access_token
+
+
+def load_kakao_receiver_uuids() -> list[str]:
+    """kakao_friend_setup.py에서 선택한 수신자 uuid 목록을 읽습니다."""
+    if not KAKAO_RECIPIENTS_FILE.exists():
+        return []
+    try:
+        data = json.loads(KAKAO_RECIPIENTS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"카카오 수신자 파일을 읽지 못했습니다: {e}") from e
+
+    raw_uuids = data.get("receiver_uuids", []) if isinstance(data, dict) else []
+    if not isinstance(raw_uuids, list):
+        raise RuntimeError("kakao_friend_recipients.json의 receiver_uuids 형식이 올바르지 않습니다.")
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in raw_uuids:
+        uuid = str(value).strip()
+        if uuid and uuid not in seen:
+            seen.add(uuid)
+            result.append(uuid)
+    return result
+
+
+def _chunks(values: list[str], size: int = 5):
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
+def kakao_send_text_to_friends(
+    access_token: str,
+    receiver_uuids: list[str],
+    text: str,
+    link_url: str,
+) -> dict:
+    """카카오톡 친구에게 기본 텍스트 템플릿을 전송합니다(요청당 최대 5명)."""
+    if not receiver_uuids or len(receiver_uuids) > 5:
+        raise ValueError("receiver_uuids는 1~5명이어야 합니다.")
+
     template_object = {
         "object_type": "text",
-        "text": text[:200],  # 텍스트형 기본 템플릿은 최대 200자
+        "text": text[:200],
         "link": {"web_url": link_url, "mobile_web_url": link_url},
+        "button_title": "자세히 보기",
     }
     data = urlencode(
-        {"template_object": json.dumps(template_object, ensure_ascii=False)}
+        {
+            "receiver_uuids": json.dumps(receiver_uuids, ensure_ascii=False),
+            "template_object": json.dumps(template_object, ensure_ascii=False),
+        }
     ).encode("utf-8")
+
     request = urllib.request.Request(
-        "https://kapi.kakao.com/v2/api/talk/memo/default/send",
+        "https://kapi.kakao.com/v1/api/talk/friends/message/default/send",
         data=data,
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
         },
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"카카오 친구 메시지 API 오류({e.code}): {detail}") from e
 
 
 def build_kakao_summary(
     results: list[tuple[Site, list[Item], str | None]], total: int
-) -> tuple[str, str]:
-    """카카오톡 메시지용 요약(최대 200자)과, 메시지에 붙일 링크 1개를 만듭니다.
-
-    전체 리포트는 길어서(200자 제한) 그대로 못 보내니, 사이트별 건수 요약만
-    보내고 자세한 내용은 메일을 보라고 안내합니다. 링크는 오늘 수집된 글 중
-    첫 번째 글 주소를 사용하고, 하나도 없으면 농협 홈페이지로 대신합니다.
-    """
+) -> str:
+    """카카오톡 친구 메시지용 200자 이내 요약을 만듭니다."""
     today = datetime.now().strftime("%Y-%m-%d")
     site_parts = [
         f"{site.name} 오류" if err else f"{site.name} {len(items)}건"
         for site, items, err in results
     ]
-
-    link_url = "https://www.nonghyup.com"
-    for _, items, err in results:
-        if err:
-            continue
-        found = next((item.link for item in items if item.link), None)
-        if found:
-            link_url = found
-            break
-
     text = (
         f"[보도자료/뉴스] {today} ({total}건)\n"
         + ", ".join(site_parts)
-        + "\n자세한 내용은 이메일을 확인하세요."
+        + "\n자세한 내용은 수집 결과를 확인하세요."
     )
     if len(text) > 200:
         text = text[:197] + "..."
-    return text, link_url
+    return text
 
 
-def send_kakao(results: list[tuple[Site, list[Item], str | None]], total: int) -> None:
-    if not KAKAO_TOKENS_FILE.exists():
-        return  # 설정 안 함(선택 기능) -> 조용히 건너뜀
-
-    # [추가] kakao.txt에 있는 이름만 실제 수신 대상으로 걸러냅니다.
-    allowed_names = load_kakao_recipients(KAKAO_LIST_FILE)
-    if not allowed_names:
-        print("카카오톡을 보낼 대상이 없어 건너뜁니다.")
-        return
-
+def send_kakao(results: list[tuple[Site, list[Item], str | None]], total: int) -> tuple[int, int]:
+    """선택된 카카오 친구들에게 메시지를 보내고 (성공 수, 실패 수)를 반환합니다."""
     try:
-        tokens = json.loads(KAKAO_TOKENS_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"카카오 토큰 파일을 읽지 못했습니다: {e}")
-        return
-    if not isinstance(tokens, dict) or not tokens:
-        return
+        receiver_uuids = load_kakao_receiver_uuids()
+        if not receiver_uuids:
+            print("카카오톡 친구 수신자가 없어 건너뜁니다. kakao_friend_setup.py에서 수신자를 선택하세요.")
+            return 0, 0
 
-    allowed_keys = {name.lower() for name in allowed_names}
-    tokens = {name: info for name, info in tokens.items() if name.lower() in allowed_keys}
-    if not tokens:
-        print(f"{KAKAO_LIST_FILE.name}에 있는 이름과 일치하는 등록된 사람이 없어 건너뜁니다.")
-        return
+        link_url = os.getenv("KAKAO_MESSAGE_LINK_URL", "").strip()
+        if not link_url.startswith(("http://", "https://")):
+            print("KAKAO_MESSAGE_LINK_URL이 없습니다. Conf/.env에 등록된 웹 도메인의 URL을 설정하세요.")
+            return 0, len(receiver_uuids)
 
-    text, link_url = build_kakao_summary(results, total)
-    changed = False
-    for name, info in tokens.items():
-        if not isinstance(info, dict):
-            continue
-        refresh_token = str(info.get("refresh_token", "")).strip()
-        if not refresh_token:
-            continue
+        access_token = kakao_sender_access_token()
+        text = build_kakao_summary(results, total)
+
+        total_success = 0
+        total_failure = 0
+        batch_no = 0
+        for batch in _chunks(receiver_uuids, 5):
+            batch_no += 1
+            payload = kakao_send_text_to_friends(access_token, batch, text, link_url)
+            success_uuids = payload.get("successful_receiver_uuids", []) or []
+            failure_info = payload.get("failure_info", []) or []
+
+            batch_success = len(success_uuids)
+            failed_uuids: set[str] = set()
+            for info in failure_info:
+                for uuid in info.get("receiver_uuids", []) or []:
+                    failed_uuids.add(str(uuid))
+                print(
+                    f"카카오톡 일부 전송 실패(배치 {batch_no}): "
+                    f"code={info.get('code')}, msg={info.get('msg')}"
+                )
+
+            # 드물게 응답에 성공/실패 UUID가 모두 명확하지 않은 경우도 실패로 계산합니다.
+            batch_failure = max(len(batch) - batch_success, len(failed_uuids))
+            total_success += batch_success
+            total_failure += batch_failure
+            print(f"카카오톡 친구 발송 배치 {batch_no}: 성공 {batch_success}명 / 실패 {batch_failure}명")
+
+        print(f"카카오톡 친구 발송 완료: 총 성공 {total_success}명 / 실패 {total_failure}명")
+        return total_success, total_failure
+    except Exception as e:
+        print(f"카카오톡 친구 전송 실패: {e}")
         try:
-            access_token, new_refresh_token = kakao_refresh_access_token(refresh_token)
-            if new_refresh_token and new_refresh_token != refresh_token:
-                info["refresh_token"] = new_refresh_token
-                changed = True
-            kakao_send_text(access_token, text, link_url)
-            print(f"카카오톡을 보냈습니다: {name}")
-        except Exception as e:
-            # 카카오 전송 실패가 메일 발송 성공까지 막으면 안 되므로, 여기서
-            # 잡아서 로그만 남기고 다음 사람/다음 실행으로 넘어갑니다.
-            print(f"카카오톡 전송 실패 ({name}): {e}")
-
-    if changed:
-        KAKAO_TOKENS_FILE.write_text(
-            json.dumps(tokens, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+            expected = len(load_kakao_receiver_uuids())
+        except Exception:
+            expected = 0
+        return 0, expected
 
 
 # ------------------------------------------------------------------------
@@ -970,7 +997,10 @@ def main() -> None:
     if should_send:
         if send_email_too:
             send_email(body, saved_path, total)
-        send_kakao(results, total)
+        kakao_success, kakao_failure = send_kakao(results, total)
+        if kakao_failure:
+            print(f"주의: 카카오톡 미전송 수신자가 {kakao_failure}명 있습니다.")
+        # 기존 중복 방지 정책은 유지합니다. 테스트 중 재발송이 필요하면 FORCE_SEND=1을 사용하세요.
         save_sent_state(SENT_STATE_FILE, today, prev_signatures | current_signatures)
     else:
         print("이전 실행 이후 새로 등록된 내용이 없어 메일/카카오톡 발송을 생략합니다.")
