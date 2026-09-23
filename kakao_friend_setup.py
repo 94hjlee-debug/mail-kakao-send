@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 """
-카카오톡 '친구에게 보내기' 초기 설정 도우미.
+카카오톡 '친구에게 보내기' 수신자 관리 도우미.
 
-기능
-1) 발신자 1명 인증 -> Conf/kakao_sender_token.json 저장
-2) 수신 직원을 앱에 연결/동의시킴 -> 토큰은 저장하지 않음
-3) 발신자의 카카오 친구 목록을 조회 -> 실제 수신자 선택 ->
-   Conf/kakao_friend_recipients.json에 uuid만 저장
+관리 방식
+- Conf/kakao.txt: 실제 발송 대상 '이름' 목록 (한 줄에 한 명)
+- Conf/kakao_friend_recipients.json: 이름 -> 카카오 친구 uuid 매핑
+- kakao_send.py는 두 파일을 함께 읽어 kakao.txt에 있는 이름만 발송
 
-주의
-- 카카오디벨로퍼스 앱에서 카카오 로그인, Redirect URI, friends/talk_message 동의항목,
-  카카오톡 친구 목록/메시지 사용 권한이 준비되어 있어야 합니다.
-- 사용 권한 승인 전 테스트에서는 앱 멤버만 친구 목록 응답에 포함됩니다.
-- 수신 직원은 발신자의 실제 카카오톡 친구이면서 같은 앱에 연결되어 있어야 합니다.
+메뉴
+1) 발신자 인증/갱신
+2) 수신 직원 앱 연결/동의
+3) 발송 사용자 등록 (이름 + 카카오 친구 매핑)
+4) 등록 사용자 삭제
+5) 등록 사용자 조회
+6) 종료
 """
 
 import json
@@ -37,6 +38,7 @@ CONF_DIR = ROOT / "Conf"
 ENV_FILE = CONF_DIR / ".env"
 SENDER_TOKEN_FILE = CONF_DIR / "kakao_sender_token.json"
 RECIPIENTS_FILE = CONF_DIR / "kakao_friend_recipients.json"
+KAKAO_LIST_FILE = CONF_DIR / "kakao.txt"
 REDIRECT_URI = "http://localhost:5000"
 SCOPES = "friends,talk_message"
 
@@ -49,13 +51,21 @@ def load_env(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        # Conf/.env 값을 우선 사용
+        os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
 def write_json_atomic(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(path)
+
+
+def save_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(text, encoding="utf-8")
     temp.replace(path)
 
 
@@ -72,8 +82,6 @@ def extract_code(pasted: str) -> str:
 
 
 def make_authorize_url(client_id: str) -> str:
-    # prompt=login: 여러 사람이 같은 PC/브라우저에서 순차 인증할 때
-    # 이전 로그인 세션 때문에 잘못된 계정으로 연결되는 것을 줄입니다.
     return "https://kauth.kakao.com/oauth/authorize?" + urllib.parse.urlencode(
         {
             "client_id": client_id,
@@ -123,7 +131,9 @@ def exchange_code(client_id: str, client_secret: str, code: str) -> dict:
         raise RuntimeError(f"토큰 발급 실패({e.code}): {detail}") from e
 
 
-def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> tuple[str, str | None]:
+def refresh_access_token(
+    client_id: str, client_secret: str, refresh_token: str
+) -> tuple[str, str | None]:
     data = {
         "grant_type": "refresh_token",
         "client_id": client_id,
@@ -150,7 +160,7 @@ def refresh_access_token(client_id: str, client_secret: str, refresh_token: str)
 def register_sender(client_id: str, client_secret: str) -> None:
     code = request_authorization_code(
         client_id,
-        "[발신자 인증] 실제로 16명에게 메시지를 보낼 카카오계정으로 로그인하세요.",
+        "[발신자 인증] 직원들에게 메시지를 보낼 카카오계정으로 로그인하세요.",
     )
     payload = exchange_code(client_id, client_secret, code)
     refresh_token = str(payload.get("refresh_token", "")).strip()
@@ -176,10 +186,9 @@ def connect_recipient(client_id: str, client_secret: str) -> None:
     payload = exchange_code(client_id, client_secret, code)
     if not payload.get("access_token"):
         raise RuntimeError(f"access_token이 없습니다. 응답: {payload}")
-    # 수신 직원 토큰은 발송에 필요하지 않으므로 저장하지 않습니다.
     print("\n직원 앱 연결/동의가 완료되었습니다.")
-    print("이 직원의 토큰은 저장하지 않습니다.")
-    print("다음 직원도 등록하려면 같은 메뉴를 다시 실행하세요.")
+    print("직원 토큰은 저장하지 않습니다.")
+    print("이제 메뉴 3에서 발신자의 친구 목록 중 해당 직원을 선택하고 이름을 등록하세요.")
 
 
 def load_sender_refresh_token() -> str:
@@ -197,7 +206,9 @@ def load_sender_refresh_token() -> str:
 
 def sender_access_token(client_id: str, client_secret: str) -> str:
     refresh_token = load_sender_refresh_token()
-    access_token, new_refresh_token = refresh_access_token(client_id, client_secret, refresh_token)
+    access_token, new_refresh_token = refresh_access_token(
+        client_id, client_secret, refresh_token
+    )
     if new_refresh_token and new_refresh_token != refresh_token:
         current = json.loads(SENDER_TOKEN_FILE.read_text(encoding="utf-8"))
         current["refresh_token"] = new_refresh_token
@@ -241,70 +252,238 @@ def get_friends(access_token: str) -> list[dict]:
     return friends
 
 
-def parse_selection(raw: str, max_index: int) -> list[int]:
-    result: list[int] = []
-    seen: set[int] = set()
-    for token in raw.replace(" ", "").split(","):
-        if not token:
+def load_active_names() -> list[str]:
+    """Conf/kakao.txt에서 실제 발송 대상 이름을 읽습니다."""
+    if not KAKAO_LIST_FILE.exists():
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw in KAKAO_LIST_FILE.read_text(encoding="utf-8").splitlines():
+        name = raw.strip()
+        if not name or name.startswith("#"):
             continue
-        if "-" in token:
-            left, right = token.split("-", 1)
-            start, end = int(left), int(right)
-            values = range(start, end + 1)
-        else:
-            values = [int(token)]
-        for value in values:
-            if not 1 <= value <= max_index:
-                raise ValueError(f"선택 번호가 범위를 벗어났습니다: {value}")
-            if value not in seen:
-                seen.add(value)
-                result.append(value)
-    return result
+        key = name.casefold()
+        if key not in seen:
+            seen.add(key)
+            names.append(name)
+    return names
 
 
-def select_recipients(client_id: str, client_secret: str) -> None:
+def save_active_names(names: list[str]) -> None:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        name = raw.strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(name)
+    text = "".join(f"{name}\n" for name in unique)
+    save_text_atomic(KAKAO_LIST_FILE, text)
+
+
+def load_recipient_registry() -> dict[str, dict]:
+    """이름 -> {uuid, profile_nickname, registered_at} 매핑을 읽습니다."""
+    if not RECIPIENTS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(RECIPIENTS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"카카오 수신자 파일을 읽지 못했습니다: {e}") from e
+
+    if not isinstance(data, dict):
+        raise RuntimeError("kakao_friend_recipients.json 형식이 올바르지 않습니다.")
+
+    recipients = data.get("recipients")
+    if isinstance(recipients, dict):
+        result: dict[str, dict] = {}
+        for name, info in recipients.items():
+            if isinstance(info, dict) and str(info.get("uuid", "")).strip():
+                result[str(name)] = info
+        return result
+
+    # 이전 버전은 uuid 배열만 있어 이름 기반 필터링이 불가능합니다.
+    if isinstance(data.get("receiver_uuids"), list) and data.get("receiver_uuids"):
+        print(
+            "[안내] 기존 kakao_friend_recipients.json은 이름 정보가 없는 이전 형식입니다.\n"
+            "       메뉴 3에서 사용자를 이름과 함께 다시 등록하면 새 형식으로 전환됩니다."
+        )
+    return {}
+
+
+def save_recipient_registry(registry: dict[str, dict]) -> None:
+    write_json_atomic(
+        RECIPIENTS_FILE,
+        {
+            "recipients": registry,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
+
+
+def _find_registry_name(registry: dict[str, dict], name: str) -> str | None:
+    wanted = name.strip().casefold()
+    for saved_name in registry:
+        if saved_name.casefold() == wanted:
+            return saved_name
+    return None
+
+
+def _ensure_active_name(name: str) -> None:
+    names = load_active_names()
+    if not any(saved.casefold() == name.casefold() for saved in names):
+        names.append(name)
+        save_active_names(names)
+
+
+def register_recipient(client_id: str, client_secret: str) -> None:
+    """친구 한 명을 선택해 관리 이름과 uuid를 저장하고 kakao.txt에도 활성화합니다."""
     access_token = sender_access_token(client_id, client_secret)
     friends = get_friends(access_token)
     if not friends:
         print("\n조회 가능한 친구가 없습니다.")
-        print("수신 직원이 발신자의 카카오 친구인지, 같은 앱에 연결/동의했는지,")
-        print("그리고 앱의 친구 목록/메시지 사용 권한이 준비됐는지 확인하세요.")
+        print("직원 앱 연결/동의, 실제 카카오 친구 관계, 앱 권한을 확인하세요.")
         return
 
-    print("\n조회된 친구 목록")
+    registry = load_recipient_registry()
+    registered_uuids = {
+        str(info.get("uuid", "")).strip(): name
+        for name, info in registry.items()
+        if str(info.get("uuid", "")).strip()
+    }
+
+    print("\n발신자의 조회 가능한 친구 목록")
     print("-" * 72)
     for i, friend in enumerate(friends, start=1):
         nickname = str(friend.get("profile_nickname", "(닉네임 없음)"))
-        favorite = "★" if friend.get("favorite") else " "
-        print(f"{i:>3}. {favorite} {nickname}")
+        uuid = str(friend.get("uuid", "")).strip()
+        saved_name = registered_uuids.get(uuid)
+        status = f" [등록됨: {saved_name}]" if saved_name else ""
+        print(f"{i:>3}. {nickname}{status}")
     print("-" * 72)
-    print("보낼 직원을 번호로 선택하세요. 예: 1,2,5-8")
-    raw = input("선택: ").strip()
-    indexes = parse_selection(raw, len(friends))
-    if not indexes:
-        print("선택된 수신자가 없습니다.")
+
+    raw = input("등록할 친구 번호: ").strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= len(friends):
+        raise ValueError("친구 번호를 올바르게 입력하세요.")
+    friend = friends[int(raw) - 1]
+    uuid = str(friend.get("uuid", "")).strip()
+    nickname = str(friend.get("profile_nickname", "(닉네임 없음)")).strip()
+    if not uuid:
+        raise RuntimeError("선택한 친구의 uuid가 없습니다.")
+
+    name = input("kakao.txt에 사용할 사용자 이름(예: 홍길동): ").strip()
+    if not name:
+        raise ValueError("사용자 이름은 비워둘 수 없습니다.")
+    if name.startswith("#"):
+        raise ValueError("사용자 이름은 #으로 시작할 수 없습니다.")
+
+    # 같은 uuid가 다른 이름으로 이미 등록돼 있으면 중복을 방지합니다.
+    existing_for_uuid = registered_uuids.get(uuid)
+    if existing_for_uuid and existing_for_uuid.casefold() != name.casefold():
+        answer = input(
+            f"이 카카오 친구는 이미 '{existing_for_uuid}' 이름으로 등록되어 있습니다. "
+            f"'{name}'으로 이름을 바꿀까요? (y/N): "
+        ).strip().lower()
+        if answer not in {"y", "yes"}:
+            print("등록을 취소했습니다.")
+            return
+        registry.pop(existing_for_uuid, None)
+        active = [n for n in load_active_names() if n.casefold() != existing_for_uuid.casefold()]
+        save_active_names(active)
+
+    existing_name = _find_registry_name(registry, name)
+    if existing_name and existing_name != name:
+        # 대소문자 차이만 있는 이름은 기존 키를 정리
+        registry.pop(existing_name, None)
+
+    registry[name] = {
+        "uuid": uuid,
+        "profile_nickname": nickname,
+        "registered_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_recipient_registry(registry)
+    _ensure_active_name(name)
+
+    print("\n사용자 등록 완료")
+    print(f"관리 이름 : {name}")
+    print(f"카카오 닉네임 : {nickname}")
+    print(f"활성 목록 : {KAKAO_LIST_FILE}")
+    print(f"UUID 매핑 : {RECIPIENTS_FILE}")
+    print("kakao.txt에 이름이 있는 동안 kakao_send.py의 친구 발송 대상이 됩니다.")
+
+
+def list_recipients() -> None:
+    registry = load_recipient_registry()
+    active_names = load_active_names()
+    active_keys = {name.casefold() for name in active_names}
+
+    all_names = list(registry.keys())
+    # kakao.txt에만 있고 매핑이 없는 이름도 보여줌
+    for name in active_names:
+        if not any(saved.casefold() == name.casefold() for saved in all_names):
+            all_names.append(name)
+
+    if not all_names:
+        print("\n등록된 사용자가 없습니다.")
         return
 
-    uuids: list[str] = []
-    selected_names: list[str] = []
-    for index in indexes:
-        friend = friends[index - 1]
-        uuid = str(friend.get("uuid", "")).strip()
-        if not uuid:
-            continue
-        uuids.append(uuid)
-        selected_names.append(str(friend.get("profile_nickname", "(닉네임 없음)")))
+    print("\n등록 사용자")
+    print("-" * 72)
+    for i, name in enumerate(all_names, start=1):
+        key = _find_registry_name(registry, name)
+        info = registry.get(key, {}) if key else {}
+        nickname = str(info.get("profile_nickname", "-")).strip() or "-"
+        status = "발송 ON" if name.casefold() in active_keys else "발송 OFF"
+        mapped = "매핑 OK" if info.get("uuid") else "UUID 없음"
+        print(f"{i:>3}. {name} | {status} | {mapped} | 카카오닉네임: {nickname}")
+    print("-" * 72)
+    print(f"실제 발송 대상 파일: {KAKAO_LIST_FILE}")
 
-    write_json_atomic(
-        RECIPIENTS_FILE,
-        {
-            "receiver_uuids": uuids,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        },
-    )
-    print(f"\n수신자 {len(uuids)}명 저장 완료: {', '.join(selected_names)}")
-    print(f"저장 위치: {RECIPIENTS_FILE}")
-    print("이 파일도 GitHub에 올리지 마세요.")
+
+def delete_recipient() -> None:
+    registry = load_recipient_registry()
+    active_names = load_active_names()
+
+    all_names = list(registry.keys())
+    for name in active_names:
+        if not any(saved.casefold() == name.casefold() for saved in all_names):
+            all_names.append(name)
+
+    if not all_names:
+        print("\n삭제할 사용자가 없습니다.")
+        return
+
+    print("\n삭제할 사용자")
+    print("-" * 72)
+    for i, name in enumerate(all_names, start=1):
+        key = _find_registry_name(registry, name)
+        info = registry.get(key, {}) if key else {}
+        nickname = str(info.get("profile_nickname", "-")).strip() or "-"
+        print(f"{i:>3}. {name} (카카오닉네임: {nickname})")
+    print("-" * 72)
+
+    raw = input("삭제할 번호: ").strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= len(all_names):
+        raise ValueError("삭제할 번호를 올바르게 입력하세요.")
+    name = all_names[int(raw) - 1]
+
+    answer = input(f"'{name}' 사용자를 발송목록과 UUID 매핑에서 모두 삭제할까요? (y/N): ").strip().lower()
+    if answer not in {"y", "yes"}:
+        print("삭제를 취소했습니다.")
+        return
+
+    key = _find_registry_name(registry, name)
+    if key:
+        registry.pop(key, None)
+        save_recipient_registry(registry)
+
+    active = [n for n in active_names if n.casefold() != name.casefold()]
+    save_active_names(active)
+
+    print(f"\n삭제 완료: {name}")
+    print("이 사용자는 kakao_send.py의 친구 발송 대상에서 제외됩니다.")
 
 
 def main() -> None:
@@ -317,11 +496,13 @@ def main() -> None:
 
     while True:
         print("\n" + "=" * 72)
-        print("카카오 친구 발송 초기 설정")
+        print("카카오 친구 발송 사용자 관리")
         print("1. 발신자 인증/갱신")
         print("2. 수신 직원 앱 연결/동의")
-        print("3. 발신자의 친구 목록 조회 및 수신자 선택")
-        print("4. 종료")
+        print("3. 발송 사용자 등록 (이름 + 카카오 친구 매핑)")
+        print("4. 등록 사용자 삭제")
+        print("5. 등록 사용자 조회")
+        print("6. 종료")
         print("=" * 72)
         choice = input("선택: ").strip()
 
@@ -331,11 +512,15 @@ def main() -> None:
             elif choice == "2":
                 connect_recipient(client_id, client_secret)
             elif choice == "3":
-                select_recipients(client_id, client_secret)
+                register_recipient(client_id, client_secret)
             elif choice == "4":
+                delete_recipient()
+            elif choice == "5":
+                list_recipients()
+            elif choice == "6":
                 break
             else:
-                print("1~4 중에서 선택하세요.")
+                print("1~6 중에서 선택하세요.")
         except (RuntimeError, ValueError) as e:
             print(f"[오류] {e}")
 
