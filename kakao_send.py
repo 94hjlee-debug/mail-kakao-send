@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -52,6 +53,9 @@ SEEN_LINKS_KEEP_DAYS = 30  # 이 기간이 지난 캐시 항목은 자동으로 
 # 똑같으면(추가로 새로 올라온 글/새 오류가 없으면) 메일·카카오톡 발송을
 # 건너뛰기 위한 "오늘 보낸 내용" 기록 파일. 날짜가 바뀌면 자동으로 초기화됩니다.
 SENT_STATE_FILE = STATE_DIR / "sent_today.json"
+# 날짜 경계를 넘어 신규 글을 놓치지 않기 위한 영구 발송 이력.
+SENT_ITEMS_FILE = STATE_DIR / "sent_items.json"
+SENT_ITEMS_KEEP_DAYS = 14
 
 
 @dataclass
@@ -208,6 +212,45 @@ def save_sent_state(path: Path, date_str: str, signatures: set[str]) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def load_sent_items(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def save_sent_items(path: Path, sent: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(sent, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(path)
+
+
+def prune_sent_items(sent: dict[str, str], keep_days: int = SENT_ITEMS_KEEP_DAYS) -> dict[str, str]:
+    cutoff = datetime.now() - timedelta(days=keep_days)
+    result: dict[str, str] = {}
+    for key, stamp in sent.items():
+        try:
+            dt = datetime.fromisoformat(stamp)
+        except ValueError:
+            continue
+        if dt >= cutoff:
+            result[key] = stamp
+    return result
+
+
+def item_signature(site: Site, item: Item) -> str:
+    identity = item.link.strip() if item.link else ""
+    if not identity:
+        identity = f"{item_date(item.pub_date) or ''}|{item.title.strip()}"
+    return f"{site.name}::{identity}"
 
 
 # ------------------------------------------------------------------------
@@ -439,15 +482,41 @@ def parse_html_items(base_url: str, text: str) -> list[Item]:
     return [Item(title=t, pub_date=d, link=l) for t, d, l in general_parser.items]
 
 
+# 농림축산식품부 보도자료는 일반 HTML 목록보다 공식 RSS를 우선 사용합니다.
+# HTML 목록은 날짜가 제목 링크와 다른 DOM 영역에 있어 범용 파서가 과거 날짜를
+# 놓칠 수 있습니다. RSS는 제목/링크/발행일을 함께 제공하므로 날짜 테스트가 안정적입니다.
+MAFRA_HOST_MARKER = "mafra.go.kr"
+MAFRA_PRESS_PATH_MARKER = "/home/5109/"
+MAFRA_RSS_URL = "https://www.mafra.go.kr/bbs/home/792/rssList.do?row={rows}"
+
+
+def fetch_mafra_press_items(site: Site) -> list[Item]:
+    raw_rows = os.getenv("MAFRA_RSS_ROWS", "200").strip()
+    try:
+        rows = max(50, min(int(raw_rows), 1000))
+    except ValueError:
+        rows = 200
+
+    rss_url = MAFRA_RSS_URL.format(rows=rows)
+    content_type, data = fetch_bytes(rss_url)
+    text = decode_body(content_type, data)
+    items = parse_rss_items(text)
+    if not items:
+        raise RuntimeError("농림축산식품부 RSS에서 보도자료를 찾지 못했습니다.")
+    return items
+
+
 def fetch_items(site: Site) -> list[Item]:
-    # [수정] 예전에는 여기서 에러를 잡아 빈 목록만 돌려줘서, 실제로는 수집이
-    # 실패(예: 440)했는데도 리포트에는 그냥 "오늘 등록된 글이 없습니다"로만
-    # 보여서 원인을 알 수 없었습니다. 이제는 에러를 그대로 위(main)로 올려서
-    # 리포트에 "수집 상태: 오류 발생 (...)"으로 실제 원인이 찍히게 합니다.
+    # 사이트별로 날짜/목록 구조가 다른 곳은 전용 수집기를 우선 사용합니다.
     if FIRST_EPRO_HOST_MARKER in site.url:
         return fetch_first_epro_items(site)
     if NONGHYUP_BID_PATH_MARKER in site.url:
         return fetch_nonghyup_bid_items(site)
+
+    lowered_url = site.url.lower()
+    if MAFRA_HOST_MARKER in lowered_url and MAFRA_PRESS_PATH_MARKER in lowered_url:
+        return fetch_mafra_press_items(site)
+
     content_type, data = fetch_bytes(site.url)
     text = decode_body(content_type, data)
     if looks_like_rss(site.url, content_type, text):
@@ -461,18 +530,32 @@ def item_date(pub_date: str) -> str | None:
     if not pub_date:
         return None
     raw = pub_date.strip()
-    date_part = raw[:10].replace(".", "-").replace("/", "-")
-    try:
-        return datetime.strptime(date_part, "%Y-%m-%d").strftime("%Y-%m-%d")
-    except ValueError:
-        pass
-    # [추가] "20260914"처럼 구분자 없는 8자리 날짜 형식도 지원 (first-epro 등 API 응답 대응)
-    digits = raw[:8]
-    if len(digits) == 8 and digits.isdigit():
+
+    # YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD 및 뒤에 시간이 붙는 형식
+    match = re.search(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", raw)
+    if match:
+        y, m, d = match.groups()
         try:
-            return datetime.strptime(digits, "%Y%m%d").strftime("%Y-%m-%d")
+            return datetime(int(y), int(m), int(d)).strftime("%Y-%m-%d")
         except ValueError:
-            return None
+            pass
+
+    # 20260914처럼 구분자 없는 날짜
+    match = re.search(r"(?<!\d)(20\d{6})(?!\d)", raw)
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # RSS에서 흔한 RFC 2822 날짜 예: Wed, 16 Sep 2026 17:00:00 +0900
+    try:
+        parsed = parsedate_to_datetime(raw)
+        if parsed is not None:
+            return parsed.strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError):
+        pass
+
     return None
 
 
@@ -581,7 +664,7 @@ def _fetch_first_epro_records(site: Site) -> list[dict]:
     except ValueError:
         max_pages = 5
 
-    target = target_search_date()
+    target = oldest_search_date()
     all_records: list[dict] = []
     seen_keys: set[tuple[str, str, str]] = set()
 
@@ -635,7 +718,7 @@ def _fetch_first_epro_records(site: Site) -> list[dict]:
             break
 
         # 최신순 목록이므로 현재 페이지에서 이미 대상일보다 과거까지 내려왔다면 종료합니다.
-        if page_dates and min(page_dates) <= target:
+        if page_dates and min(page_dates) < target:
             break
 
     return all_records
@@ -685,40 +768,53 @@ def fetch_first_epro_items(site: Site) -> list[Item]:
     return items
 
 
+def search_mode() -> str:
+    raw = os.getenv("SEARCH_MODE", "NEW").strip().upper()
+    if raw in {"NEW", "ROLLING", "INCREMENTAL"}:
+        return "NEW"
+    if raw in {"DATE", "DAY"}:
+        return "DATE"
+    print(f"SEARCH_MODE={raw!r} 값을 알 수 없어 NEW로 처리합니다.")
+    return "NEW"
+
+
 def search_days_ago() -> int:
-    """Conf/.env의 SEARCH_DAYS_AGO 값을 읽습니다. 0=오늘, 1=어제, 2=이틀 전."""
     raw = os.getenv("SEARCH_DAYS_AGO", "0").strip()
     try:
-        value = int(raw)
+        return max(0, int(raw))
     except ValueError:
-        print(f"SEARCH_DAYS_AGO={raw!r} 값이 올바르지 않아 0(오늘)으로 처리합니다.")
+        print(f"SEARCH_DAYS_AGO={raw!r} 값이 올바르지 않아 0으로 처리합니다.")
         return 0
-    if value < 0:
-        print("SEARCH_DAYS_AGO는 0 이상이어야 하므로 0(오늘)으로 처리합니다.")
-        return 0
-    return value
+
+
+def search_lookback_days() -> int:
+    raw = os.getenv("SEARCH_LOOKBACK_DAYS", "1").strip()
+    try:
+        return max(1, min(int(raw), 7))
+    except ValueError:
+        return 1
+
+
+def search_window_dates() -> tuple[str, str]:
+    now = datetime.now()
+    if search_mode() == "DATE":
+        target = (now - timedelta(days=search_days_ago())).strftime("%Y-%m-%d")
+        return target, target
+    end = now.strftime("%Y-%m-%d")
+    start = (now - timedelta(days=search_lookback_days())).strftime("%Y-%m-%d")
+    return start, end
+
+
+def oldest_search_date() -> str:
+    return search_window_dates()[0]
 
 
 def target_search_date() -> str:
-    return (datetime.now() - timedelta(days=search_days_ago())).strftime("%Y-%m-%d")
+    return search_window_dates()[1]
 
 
 def todays_items(items: list[Item], seen_links: dict[str, str]) -> list[Item]:
-    """
-    SEARCH_DAYS_AGO로 지정한 날짜의 글만 골라냅니다.
-
-    - SEARCH_DAYS_AGO=0: 오늘
-    - SEARCH_DAYS_AGO=1: 어제
-    - SEARCH_DAYS_AGO=2: 이틀 전
-
-    날짜가 있는 항목은 해당 날짜와 정확히 비교합니다.
-    날짜가 없는 항목은 과거 날짜를 판별할 근거가 없으므로,
-    오늘 검색(0)일 때는 처음 본 링크만 신규로 포함합니다.
-    이미 seen_links에 기록된 링크는 기록된 최초 발견일이 검색 대상일과
-    같을 때만 포함합니다.
-    """
     target = target_search_date()
-    days_ago = search_days_ago()
     matched: list[Item] = []
     for item in items:
         parsed_dt = item_date(item.pub_date)
@@ -726,34 +822,53 @@ def todays_items(items: list[Item], seen_links: dict[str, str]) -> list[Item]:
             if parsed_dt == target:
                 matched.append(item)
             continue
-
-        if not item.link:
-            continue
-        first_seen = seen_links.get(item.link)
-        if first_seen == target:
-            matched.append(item)
-        elif days_ago == 0 and first_seen is None:
+        if item.link and seen_links.get(item.link) == target:
             matched.append(item)
     return matched
 
 
+def new_unsent_items(site: Site, items: list[Item], sent_items: dict[str, str]) -> list[Item]:
+    start, end = search_window_dates()
+    matched: list[Item] = []
+    for item in items:
+        parsed_dt = item_date(item.pub_date)
+        if parsed_dt and not (start <= parsed_dt <= end):
+            continue
+        if item_signature(site, item) in sent_items:
+            continue
+        matched.append(item)
+    return matched
+
+
+def select_items(site: Site, items: list[Item], seen_links: dict[str, str], sent_items: dict[str, str]) -> list[Item]:
+    if search_mode() == "DATE":
+        return todays_items(items, seen_links)
+    return new_unsent_items(site, items, sent_items)
+
+
 def build_report(results: list[tuple[Site, list[Item], str | None]]) -> str:
-    target = target_search_date()
-    days_ago = search_days_ago()
-    lines = [
-        f"수집 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"검색 대상일: {target} (SEARCH_DAYS_AGO={days_ago})",
-        "",
-    ]
+    start, end = search_window_dates()
+    if search_mode() == "NEW":
+        lines = [
+            f"수집 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "검색 모드: 신규 미발송 항목",
+            f"재조회 범위: {start} ~ {end}",
+            "",
+        ]
+    else:
+        lines = [
+            f"수집 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"검색 대상일: {end} (SEARCH_DAYS_AGO={search_days_ago()})",
+            "",
+        ]
     for site, items, err in results:
         lines.append(f"[{site.name}]")
         if site.note:
             lines.append(f"비고: {site.note}")
-
         if err:
             lines.append(f"수집 상태: 오류 발생 ({err})")
         elif not items:
-            lines.append(f"{target} 등록된 글이 없습니다.")
+            lines.append("새로 등록된 내용이 없습니다." if search_mode() == "NEW" else f"{end} 등록된 글이 없습니다.")
         else:
             for index, item in enumerate(items, start=1):
                 lines.append(f"{index}. {item.title}")
@@ -767,8 +882,11 @@ def build_report(results: list[tuple[Site, list[Item], str | None]]) -> str:
 
 def save_file(text: str) -> Path:
     OUTPUT_DIR.mkdir(exist_ok=True)
-    target = target_search_date()
-    path = OUTPUT_DIR / f"보도자료_{target}.txt"
+    if search_mode() == "NEW":
+        stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+        path = OUTPUT_DIR / f"보도자료_{stamp}.txt"
+    else:
+        path = OUTPUT_DIR / f"보도자료_{target_search_date()}.txt"
     path.write_text(text, encoding="utf-8")
     return path
 
@@ -988,21 +1106,37 @@ def _chunks(values: list[str], size: int = 5):
         yield values[index:index + size]
 
 
-def kakao_send_custom_to_self(
+def kakao_text_link() -> dict[str, str]:
+    """카카오 기본 텍스트 템플릿에 필요한 링크 정보를 반환합니다."""
+    url = os.getenv("KAKAO_TEXT_LINK_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            "KAKAO_TEXT_LINK_URL이 없습니다. Conf/.env에 Kakao Developers 제품 링크 관리에 등록한 실제 URL을 설정하세요."
+        )
+    return {"web_url": url, "mobile_web_url": url}
+
+
+def kakao_send_default_text_to_self(
     access_token: str,
-    template_id: str,
-    template_args: dict[str, str],
+    text: str,
 ) -> None:
-    """사용자 정의 리스트 템플릿으로 발신자 본인에게 전송합니다."""
+    """카카오 기본 텍스트 템플릿으로 발신자 본인에게 전송합니다.
+
+    link 객체 자체는 API 형식상 포함하지만 URL 값은 넣지 않습니다.
+    메시지 본문에는 제목과 수집 내용만 전달합니다.
+    """
+    template_object = {
+        "object_type": "text",
+        "text": text[:200],
+        "link": kakao_text_link(),
+        "button_title": os.getenv("KAKAO_TEXT_BUTTON_TITLE", "확인").strip() or "확인",
+    }
     data = urlencode(
-        {
-            "template_id": template_id,
-            "template_args": json.dumps(template_args, ensure_ascii=False),
-        }
+        {"template_object": json.dumps(template_object, ensure_ascii=False)}
     ).encode("utf-8")
 
     request = urllib.request.Request(
-        "https://kapi.kakao.com/v2/api/talk/memo/send",
+        "https://kapi.kakao.com/v2/api/talk/memo/default/send",
         data=data,
         headers={
             "Authorization": f"Bearer {access_token}",
@@ -1017,26 +1151,30 @@ def kakao_send_custom_to_self(
         raise RuntimeError(f"카카오 나에게 보내기 API 오류({e.code}): {detail}") from e
 
 
-def kakao_send_custom_to_friends(
+def kakao_send_default_text_to_friends(
     access_token: str,
     receiver_uuids: list[str],
-    template_id: str,
-    template_args: dict[str, str],
+    text: str,
 ) -> dict:
-    """사용자 정의 리스트 템플릿으로 친구에게 전송합니다(요청당 최대 5명)."""
+    """카카오 기본 텍스트 템플릿으로 친구에게 전송합니다(요청당 최대 5명)."""
     if not receiver_uuids or len(receiver_uuids) > 5:
         raise ValueError("receiver_uuids는 1~5명이어야 합니다.")
 
+    template_object = {
+        "object_type": "text",
+        "text": text[:200],
+        "link": kakao_text_link(),
+        "button_title": os.getenv("KAKAO_TEXT_BUTTON_TITLE", "확인").strip() or "확인",
+    }
     data = urlencode(
         {
             "receiver_uuids": json.dumps(receiver_uuids, ensure_ascii=False),
-            "template_id": template_id,
-            "template_args": json.dumps(template_args, ensure_ascii=False),
+            "template_object": json.dumps(template_object, ensure_ascii=False),
         }
     ).encode("utf-8")
 
     request = urllib.request.Request(
-        "https://kapi.kakao.com/v1/api/talk/friends/message/send",
+        "https://kapi.kakao.com/v1/api/talk/friends/message/default/send",
         data=data,
         headers={
             "Authorization": f"Bearer {access_token}",
@@ -1059,76 +1197,113 @@ def _clean_kakao_text(value: str, max_chars: int) -> str:
     return value[: max_chars - 3].rstrip() + "..."
 
 
-def build_kakao_pages(
+def build_kakao_text_messages(
     results: list[tuple[Site, list[Item], str | None]], total: int
-) -> list[dict[str, str]]:
-    """
-    카카오 사용자 정의 '리스트' 템플릿에 넘길 페이지를 만듭니다.
+) -> list[str]:
+    """카카오용 텍스트 메시지를 사이트별로 묶어 만듭니다.
 
-    템플릿 사용자 인자:
-      HEADER
-      SITE1 / TITLE1
-      ...
-      SITE5 / TITLE5
-
-    한 메시지에 최대 5개 항목을 넣고, 6개 이상이면 다음 메시지로 나눕니다.
-    링크는 넣지 않습니다.
+    표시 원칙
+    - 수집 건수가 0건이어도 모든 사이트의 상태를 표시합니다.
+    - 같은 사이트의 이름은 전체 카카오 발송 내용에서 한 번만 표시합니다.
+    - 같은 사이트에 여러 건이 있으면 사이트명 아래에 1., 2., 3. 형태로 나열합니다.
+    - 한 메시지 200자 제한을 넘으면 여러 메시지로 나눕니다.
+    - 마지막 메시지에만 메일 확인 안내를 붙입니다.
     """
-    entries: list[tuple[str, str]] = []
+    target = target_search_date()
+    if search_mode() == "NEW":
+        first_header = f"[신규 입찰/보도자료] {target} ({total}건)"
+        continuation_header = f"[신규 입찰/보도자료] {target} (계속)"
+    else:
+        first_header = f"[보도자료/뉴스] {target} ({total}건)"
+        continuation_header = f"[보도자료/뉴스] {target} (계속)"
+    footer = "자세한 내용은 등록된 메일을 확인하세요."
+    footer_block = "\n\n" + footer
+
+    # 마지막 메시지에 footer를 붙여도 200자를 넘지 않도록 모든 메시지를 이 길이로 제한합니다.
+    max_body_len = 200 - len(footer_block)
+
+    messages: list[str] = []
+    current = first_header
+
+    def flush() -> None:
+        nonlocal current
+        if current.strip():
+            messages.append(current)
+        current = continuation_header
+
+    def add_piece(piece: str, *, blank_before: bool = True) -> None:
+        """짧은 텍스트 조각을 현재 메시지에 넣고, 넘치면 다음 메시지로 보냅니다."""
+        nonlocal current
+        separator = "\n\n" if blank_before else "\n"
+        candidate = current + separator + piece
+        if len(candidate) <= max_body_len:
+            current = candidate
+            return
+
+        flush()
+        separator = "\n\n" if blank_before else "\n"
+        candidate = current + separator + piece
+        if len(candidate) <= max_body_len:
+            current = candidate
+            return
+
+        # 단일 제목이 너무 길면 현재 메시지에 들어갈 수 있는 만큼만 줄입니다.
+        available = max(20, max_body_len - len(current) - len(separator))
+        current = current + separator + _clean_kakao_text(piece, available)
 
     for site, items, err in results:
+        site_header = f"[{site.name}]"
+
         if err:
-            entries.append((f"[{site.name}]", "수집 오류"))
+            # 사이트명은 한 번만 표시하고 그 아래에 상태를 붙입니다.
+            block = f"{site_header}\n수집 오류"
+            add_piece(block, blank_before=True)
             continue
 
-        for item in items:
-            title = _clean_kakao_text(item.title, 90)
-            if title:
-                entries.append((f"[{site.name}]", title))
+        if not items:
+            # 내용이 없어도 사이트별 상태를 카카오에 표시합니다.
+            block = f"{site_header}\n등록된 내용이 없습니다."
+            add_piece(block, blank_before=True)
+            continue
 
-    # FORCE_SEND 테스트 등에서 실제 신규 항목이 하나도 없을 때 표시할 내용
-    if not entries:
-        entries.append(("[신규 등록 없음]", f"{target_search_date()} 등록된 입찰공고/보도자료가 없습니다."))
+        # 같은 사이트명은 첫 항목 앞에서 한 번만 표시합니다.
+        first_title = _clean_kakao_text(items[0].title, 140)
+        first_date = item_date(items[0].pub_date)
+        first_date_label = f"({first_date[5:]}) " if search_mode() == "NEW" and first_date and first_date != target else ""
+        first_block = f"{site_header}\n1. {first_date_label}{first_title}"
+        add_piece(first_block, blank_before=True)
 
-    pages: list[dict[str, str]] = []
-    chunks = [entries[i:i + 5] for i in range(0, len(entries), 5)]
-    page_count = len(chunks)
-    target = target_search_date()
+        # 두 번째 항목부터는 사이트명을 반복하지 않습니다.
+        for index, item in enumerate(items[1:], start=2):
+            title = _clean_kakao_text(item.title, 140)
+            if not title:
+                continue
+            d = item_date(item.pub_date)
+            date_label = f"({d[5:]}) " if search_mode() == "NEW" and d and d != target else ""
+            add_piece(f"{index}. {date_label}{title}", blank_before=False)
 
-    for page_no, chunk in enumerate(chunks, start=1):
-        suffix = f" ({page_no}/{page_count})" if page_count > 1 else ""
-        args: dict[str, str] = {
-            "HEADER": f"[보도자료/뉴스] {target} ({total}건){suffix}",
-        }
-        for idx in range(1, 6):
-            if idx <= len(chunk):
-                site_name, title = chunk[idx - 1]
-                args[f"SITE{idx}"] = _clean_kakao_text(site_name, 40)
-                args[f"TITLE{idx}"] = _clean_kakao_text(title, 90)
-            else:
-                args[f"SITE{idx}"] = ""
-                args[f"TITLE{idx}"] = ""
-        pages.append(args)
+    if current.strip():
+        messages.append(current)
 
-    return pages
+    if not messages:
+        messages = [first_header]
 
+    # 마지막 메시지 하단에만 안내 문구를 붙입니다.
+    if len(messages[-1] + footer_block) <= 200:
+        messages[-1] += footer_block
+    else:
+        messages.append(continuation_header + footer_block)
 
-def _print_kakao_page(page: dict[str, str]) -> None:
-    print(page.get("HEADER", ""))
-    for idx in range(1, 6):
-        site_name = page.get(f"SITE{idx}", "").strip()
-        title = page.get(f"TITLE{idx}", "").strip()
-        if site_name and title:
-            print(site_name)
-            print(title)
+    return messages
 
 
 def send_kakao(results: list[tuple[Site, list[Item], str | None]], total: int) -> tuple[int, int]:
     """
-    카카오 사용자 정의 '리스트' 템플릿으로 보냅니다.
+    카카오 기본 '텍스트' 템플릿으로 보냅니다.
 
-    한 메시지에 최대 5개 수집 항목을 표시하며, 6개 이상이면 여러 메시지로
-    나눠 전송합니다. KAKAO_SEND_TO_SELF=1이면 본인에게도 같은 내용을 보냅니다.
+    본문은 제목 + 수집 내용만 최대한 단순하게 구성합니다.
+    link 객체에는 URL을 넣지 않습니다.
+    한 메시지 200자 제한을 넘으면 여러 메시지로 나눠 전송합니다.
     """
     receiver_uuids: list[str] = []
     send_to_self = env_flag("KAKAO_SEND_TO_SELF", True)
@@ -1140,42 +1315,36 @@ def send_kakao(results: list[tuple[Site, list[Item], str | None]], total: int) -
             print("카카오톡 발송 대상이 없습니다. 친구 수신자를 선택하거나 KAKAO_SEND_TO_SELF=1로 설정하세요.")
             return 0, 0
 
-        template_id = os.getenv("KAKAO_TEMPLATE_ID", "").strip()
-        if not template_id:
-            print("KAKAO_TEMPLATE_ID가 없습니다. 카카오 사용자 정의 리스트 템플릿 ID를 Conf/.env에 설정하세요.")
-            return 0, recipient_count
-
         access_token = kakao_sender_access_token()
-        pages = build_kakao_pages(results, total)
+        messages = build_kakao_text_messages(results, total)
 
         total_success = 0
         total_failure = 0
 
-        for page_no, page in enumerate(pages, start=1):
-            print(f"카카오 메시지 내용 ({page_no}/{len(pages)}):")
-            _print_kakao_page(page)
-            print("카카오 템플릿 전달값:", json.dumps(page, ensure_ascii=False))
+        for message_no, message in enumerate(messages, start=1):
+            print(f"카카오 텍스트 메시지 내용 ({message_no}/{len(messages)}):")
+            print(message)
 
             # 1) 발신자 본인
             if send_to_self:
                 try:
-                    kakao_send_custom_to_self(access_token, template_id, page)
+                    kakao_send_default_text_to_self(access_token, message)
                     total_success += 1
-                    print(f"카카오톡 나에게 보내기 완료 ({page_no}/{len(pages)})")
+                    print(f"카카오톡 나에게 보내기 완료 ({message_no}/{len(messages)})")
                 except Exception as e:
                     total_failure += 1
-                    print(f"카카오톡 나에게 보내기 실패 ({page_no}/{len(pages)}): {e}")
-            elif page_no == 1:
+                    print(f"카카오톡 나에게 보내기 실패 ({message_no}/{len(messages)}): {e}")
+            elif message_no == 1:
                 print("KAKAO_SEND_TO_SELF=0: 본인 카카오톡 발송은 건너뜁니다.")
 
-            # 2) 선택된 친구들
+            # 2) kakao.txt에 활성화된 친구들
             if receiver_uuids:
                 batch_no = 0
                 for batch in _chunks(receiver_uuids, 5):
                     batch_no += 1
                     try:
-                        payload = kakao_send_custom_to_friends(
-                            access_token, batch, template_id, page
+                        payload = kakao_send_default_text_to_friends(
+                            access_token, batch, message
                         )
                         success_uuids = payload.get("successful_receiver_uuids", []) or []
                         failure_info = payload.get("failure_info", []) or []
@@ -1186,7 +1355,7 @@ def send_kakao(results: list[tuple[Site, list[Item], str | None]], total: int) -
                             for uuid in info.get("receiver_uuids", []) or []:
                                 failed_uuids.add(str(uuid))
                             print(
-                                f"카카오톡 일부 전송 실패(메시지 {page_no}, 배치 {batch_no}): "
+                                f"카카오톡 일부 전송 실패(메시지 {message_no}, 배치 {batch_no}): "
                                 f"code={info.get('code')}, msg={info.get('msg')}"
                             )
 
@@ -1194,21 +1363,21 @@ def send_kakao(results: list[tuple[Site, list[Item], str | None]], total: int) -
                         total_success += batch_success
                         total_failure += batch_failure
                         print(
-                            f"카카오톡 친구 발송 메시지 {page_no}/{len(pages)}, 배치 {batch_no}: "
+                            f"카카오톡 친구 발송 메시지 {message_no}/{len(messages)}, 배치 {batch_no}: "
                             f"성공 {batch_success}명 / 실패 {batch_failure}명"
                         )
                     except Exception as e:
                         total_failure += len(batch)
                         print(
-                            f"카카오톡 친구 발송 메시지 {page_no}/{len(pages)}, "
+                            f"카카오톡 친구 발송 메시지 {message_no}/{len(messages)}, "
                             f"배치 {batch_no} 실패: {e}"
                         )
-            elif send_to_self and page_no == 1:
+            elif send_to_self and message_no == 1:
                 print("선택된 카카오 친구 수신자가 없습니다. 본인에게만 전송합니다.")
 
         self_note = " / 본인 포함" if send_to_self else " / 본인 제외"
         print(
-            f"카카오톡 발송 완료: 메시지 {len(pages)}개, "
+            f"카카오톡 발송 완료: 텍스트 메시지 {len(messages)}개, "
             f"성공 {total_success}건 / 실패 {total_failure}건{self_note}"
         )
         return total_success, total_failure
@@ -1223,21 +1392,21 @@ def send_kakao(results: list[tuple[Site, list[Item], str | None]], total: int) -
 
 def main() -> None:
     load_env(ENV_FILE)
-    target = target_search_date()
-    target_dt = datetime.strptime(target, "%Y-%m-%d")
-    print(f"검색 설정: SEARCH_DAYS_AGO={search_days_ago()} -> 대상일 {target}")
-    if target_dt.weekday() >= 5:
-        day_name = "토요일" if target_dt.weekday() == 5 else "일요일"
-        print(f"참고: 검색 대상일 {target}은 {day_name}입니다. 입찰공고가 없을 수 있습니다.")
-    if os.getenv("KAKAO_MESSAGE_LINK_URL", "").strip():
-        print("참고: KAKAO_MESSAGE_LINK_URL은 현재 코드에서 사용하지 않습니다. 404 이동은 카카오 템플릿의 공통/컴포넌트 링크 설정을 확인하세요.")
+    mode = search_mode()
+    start, end = search_window_dates()
+    if mode == "NEW":
+        print(f"검색 설정: NEW(신규 미발송) / 재조회 범위 {start} ~ {end} / LOOKBACK={search_lookback_days()}일")
+    else:
+        print(f"검색 설정: DATE / SEARCH_DAYS_AGO={search_days_ago()} -> 대상일 {end}")
 
-    # [추가] 이미 보낸 링크 캐시 로드 (오래된 항목은 정리)
-    seen_links = load_seen_links(SEEN_LINKS_FILE)
-    seen_links = prune_seen_links(seen_links)
+    if os.getenv("KAKAO_TEMPLATE_ID", "").strip():
+        print("참고: KAKAO_TEMPLATE_ID는 텍스트 전송 방식에서는 사용하지 않습니다.")
+    if env_flag("SEND_KAKAO", True) and not os.getenv("KAKAO_TEXT_LINK_URL", "").strip():
+        print("주의: KAKAO_TEXT_LINK_URL이 없어 카카오 기본 텍스트 메시지 발송이 실패합니다.")
+
+    seen_links = prune_seen_links(load_seen_links(SEEN_LINKS_FILE))
+    sent_items = prune_sent_items(load_sent_items(SENT_ITEMS_FILE))
     today = datetime.now().strftime("%Y-%m-%d")
-    newly_seen: dict[str, str] = {}
-
     results: list[tuple[Site, list[Item], str | None]] = []
     total = 0
 
@@ -1245,93 +1414,77 @@ def main() -> None:
         err_msg = None
         try:
             raw_items = fetch_items(site)
-            items = todays_items(raw_items, seen_links)
+            items = select_items(site, raw_items, seen_links, sent_items)
             total += len(items)
             undated_count = sum(1 for item in raw_items if not item_date(item.pub_date))
-            print(
-                f"{site.name}: 조회 {len(raw_items)}건 / "
-                f"대상일 {target_search_date()} {len(items)}건"
-                + (f" / 날짜정보없음 {undated_count}건" if undated_count else "")
-            )
-            # seen_links는 '오늘 신규 글' 판별용 캐시입니다. 과거 날짜 테스트가
-            # 현재 캐시를 오염시키지 않도록 오늘 검색일 때만 갱신합니다.
-            if search_days_ago() == 0:
-                for item in items:
-                    if item.link:
-                        newly_seen[item.link] = today
+            if mode == "NEW":
+                print(f"{site.name}: 조회 {len(raw_items)}건 / 재조회 {start}~{end} / 신규 미발송 {len(items)}건" + (f" / 날짜정보없음 {undated_count}건" if undated_count else ""))
+            else:
+                print(f"{site.name}: 조회 {len(raw_items)}건 / 대상일 {end} {len(items)}건" + (f" / 날짜정보없음 {undated_count}건" if undated_count else ""))
         except Exception as e:
             items = []
             err_msg = str(e)
             print(f"{site.name}: 오류 발생 ({e})")
-
         results.append((site, items, err_msg))
-
-    # 오늘 검색에서만 신규 링크 캐시를 갱신합니다.
-    if search_days_ago() == 0:
-        seen_links.update(newly_seen)
-        save_seen_links(SEEN_LINKS_FILE, seen_links)
-    else:
-        print("과거 날짜 조회 모드: seen_links 캐시는 변경하지 않습니다.")
 
     body = build_report(results)
     saved_path = save_file(body)
     print(f"저장했습니다: {saved_path}")
 
-    # [추가] 하루 여러 번 돌릴 때, 오늘 이미 보낸 내용과 똑같으면(새 글/새 오류가
-    # 없으면) 메일·카카오톡 발송을 생략합니다. 그날 첫 실행(날짜가 바뀐 뒤 처음
-    # 도는 실행)은 내용이 있든 없든 항상 보냅니다.
-    sent_state = load_sent_state(SENT_STATE_FILE)
-    is_first_run_today = sent_state.get("date") != today
-    prev_signatures = set() if is_first_run_today else set(sent_state.get("signatures", []))
-    current_signatures = build_run_signatures(results)
-    should_send = is_first_run_today or bool(current_signatures - prev_signatures)
-
-    # 발송 채널 선택. .env에서 필요에 따라 켜고 끌 수 있습니다.
     send_email_enabled = env_flag("SEND_EMAIL", True)
     send_kakao_enabled = env_flag("SEND_KAKAO", True)
-
-    print(
-        "발송 설정: "
-        f"메일={'ON' if send_email_enabled else 'OFF'}, "
-        f"카카오={'ON' if send_kakao_enabled else 'OFF'}, "
-        f"본인카카오={'ON' if env_flag('KAKAO_SEND_TO_SELF', True) else 'OFF'}"
-    )
+    send_empty = env_flag("SEND_EMPTY_RESULTS", True)
+    print("발송 설정: " + f"메일={'ON' if send_email_enabled else 'OFF'}, 카카오={'ON' if send_kakao_enabled else 'OFF'}, " + f"본인카카오={'ON' if env_flag('KAKAO_SEND_TO_SELF', True) else 'OFF'}, 0건발송={'ON' if send_empty else 'OFF'}")
 
     if not send_email_enabled and not send_kakao_enabled:
         print("SEND_EMAIL=0, SEND_KAKAO=0 입니다. 파일만 저장하고 발송은 하지 않습니다.")
         return
 
-    # FORCE_SEND=1이면 새 내용 여부와 관계없이 현재 ON인 채널로 강제 발송합니다.
-    if env_flag("FORCE_SEND", False):
-        if not should_send:
-            print("FORCE_SEND=1: 새 내용이 없어도 활성화된 채널로 강제 발송합니다.")
-        should_send = True
-
-    if should_send:
-        any_success = False
-
-        if send_email_enabled:
-            if send_email(body, saved_path, total):
-                any_success = True
-        else:
-            print("SEND_EMAIL=0: 메일 발송을 건너뜁니다.")
-
-        if send_kakao_enabled:
-            kakao_success, kakao_failure = send_kakao(results, total)
-            if kakao_success > 0:
-                any_success = True
-            if kakao_failure:
-                print(f"주의: 카카오톡 미전송 수신자가 {kakao_failure}명 있습니다.")
-        else:
-            print("SEND_KAKAO=0: 카카오톡 발송을 건너뜁니다.")
-
-        # 적어도 하나의 채널이 실제 성공한 경우에만 오늘 발송 상태를 저장합니다.
-        if any_success:
-            save_sent_state(SENT_STATE_FILE, today, prev_signatures | current_signatures)
-        else:
-            print("메일/카카오 발송 성공 건이 없어 발송 상태를 저장하지 않습니다. 다음 실행에서 재시도할 수 있습니다.")
+    if mode == "NEW":
+        should_send = bool(total) or send_empty or env_flag("FORCE_SEND", False)
     else:
-        print("이전 실행 이후 새로 등록된 내용이 없어 활성화된 채널 발송을 생략합니다.")
+        sent_state = load_sent_state(SENT_STATE_FILE)
+        is_first_run_today = sent_state.get("date") != today
+        prev_signatures = set() if is_first_run_today else set(sent_state.get("signatures", []))
+        current_signatures = build_run_signatures(results)
+        should_send = is_first_run_today or bool(current_signatures - prev_signatures) or env_flag("FORCE_SEND", False)
+
+    if not should_send:
+        print("새로 등록된 내용이 없고 0건 발송도 꺼져 있어 발송을 생략합니다.")
+        return
+
+    any_success = False
+    if send_email_enabled:
+        if send_email(body, saved_path, total):
+            any_success = True
+    else:
+        print("SEND_EMAIL=0: 메일 발송을 건너뜁니다.")
+
+    if send_kakao_enabled:
+        kakao_success, kakao_failure = send_kakao(results, total)
+        if kakao_success > 0:
+            any_success = True
+        if kakao_failure:
+            print(f"주의: 카카오톡 미전송 수신자가 {kakao_failure}명 있습니다.")
+    else:
+        print("SEND_KAKAO=0: 카카오톡 발송을 건너뜁니다.")
+
+    if any_success:
+        if mode == "NEW":
+            stamp = datetime.now().isoformat(timespec="seconds")
+            for site, items, err in results:
+                if err:
+                    continue
+                for item in items:
+                    sent_items[item_signature(site, item)] = stamp
+            save_sent_items(SENT_ITEMS_FILE, prune_sent_items(sent_items))
+            print(f"신규 발송 이력을 저장했습니다: {SENT_ITEMS_FILE}")
+        else:
+            sent_state = load_sent_state(SENT_STATE_FILE)
+            prev_signatures = set() if sent_state.get("date") != today else set(sent_state.get("signatures", []))
+            save_sent_state(SENT_STATE_FILE, today, prev_signatures | build_run_signatures(results))
+    else:
+        print("메일/카카오 발송 성공 건이 없어 신규 발송 이력을 저장하지 않습니다. 다음 실행에서 재시도합니다.")
 
 
 if __name__ == "__main__":
